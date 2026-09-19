@@ -49,9 +49,11 @@ enum DisplayRegistry {
             return requested
         }
 
-        // Exactly one external display is the only case that can be inferred safely, and
-        // it must never resolve to the main display: that maps every touch onto the wrong
-        // monitor and makes the cursor "return home" to the screen it just left.
+        // With one active display there is no ambiguity: it is the touch panel, even
+        // when it is the main display. Multi-display setups still require an unambiguous
+        // external panel or an explicit override.
+        if displays.count == 1 { return displays[0] }
+
         let externals = displays.filter { CGDisplayIsMain($0) == 0 }
         guard externals.count == 1, externals[0] != mainDisplay() else { return nil }
         return externals[0]

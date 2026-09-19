@@ -138,7 +138,7 @@ final class AppController: NSObject, NSApplicationDelegate {
                     Monitoring list.
                       System Settings → Privacy & Security → Accessibility
                     If it stays stuck, clear the old state and open the app again:
-                      tccutil reset All com.ethannguyen.touchward
+                      tccutil reset All \(Bundle.main.bundleIdentifier ?? "com.rulegen.touchward.sis")
                 """)
             Permissions.openSettings()
             pollUntilGranted()
@@ -332,6 +332,9 @@ final class AppController: NSObject, NSApplicationDelegate {
             exit(1)
         }
         self.pipeline = pipeline
+        cursorReturn.onRealMouseActivity = { [weak pipeline] in
+            pipeline?.cancelMomentum()
+        }
         pipeline.start()
     }
 
@@ -344,6 +347,7 @@ final class AppController: NSObject, NSApplicationDelegate {
     private func deactivate() {
         pipeline?.stop()
         pipeline = nil
+        cursorReturn.onRealMouseActivity = nil
         device.stop()
         panel?.dismiss()
         isTouchDisplayActive = false

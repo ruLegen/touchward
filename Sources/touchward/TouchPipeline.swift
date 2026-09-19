@@ -10,6 +10,7 @@ final class TouchPipeline {
     private let synthesizer: EventSynthesizer
     private let cursorReturn: CursorReturn
     private var mainCentre: CGPoint
+    private var shouldReturnCursor: Bool
     private var heartbeat: Timer?
 
     /// Global-coordinate rect of the on-screen keyboard while it is visible.
@@ -39,6 +40,7 @@ final class TouchPipeline {
                                        displayBounds: CGDisplayBounds(touchDisplay))
         self.palmFilter = PalmFilter(logicalMax: profile.logicalMax)
         self.mainCentre = DisplayRegistry.centre(of: mainDisplay)
+        self.shouldReturnCursor = touchDisplay != mainDisplay
     }
 
     /// Drives the clock-dependent half of the recognizer: long press on a still finger, and
@@ -62,6 +64,8 @@ final class TouchPipeline {
                                   displayBounds: CGDisplayBounds(touchDisplay),
                                   calibration: mapper.calibration)
         mainCentre = DisplayRegistry.centre(of: mainDisplay)
+        shouldReturnCursor = touchDisplay != mainDisplay
+        if !shouldReturnCursor { cursorReturn.cancelPendingReturn() }
     }
 
     var calibration: Calibration {
@@ -103,12 +107,13 @@ final class TouchPipeline {
         // work; say so once rather than leaving the user to guess why nothing scrolls.
         if frame.contacts.count >= 2, !hasSeenMultitouch {
             hasSeenMultitouch = true
-            log("✅ The panel reports \(frame.contacts.count) contacts — two-finger scrolling works.")
+            log("✅ The panel reports \(frame.contacts.count) contacts — two-finger gestures are available.")
         }
 
         // A live touch means the user is not on the mouse — drop any queued cursor return.
         if !frame.contacts.isEmpty {
             cursorReturn.cancelPendingReturn()
+            synthesizer.cancelMomentum()
         }
 
         let mapped = mapper.map(frame)
@@ -159,7 +164,7 @@ final class TouchPipeline {
         // The keyboard swallows these frames, so the recognizer never reaches
         // `sessionEnded` and nothing else would ever arm the return. Without this, one tap
         // on a key stranded the cursor on the touchscreen for the rest of the session.
-        cursorReturn.scheduleReturn(to: mainCentre)
+        if shouldReturnCursor { cursorReturn.scheduleReturn(to: mainCentre) }
     }
 
     /// Closes out anything in flight. Called on quit, on unplug, and on sleep, so a pointer
@@ -168,12 +173,18 @@ final class TouchPipeline {
         // A key may still be under a finger; let it go on quit and on unplug.
         releaseDirectPress()
         emit(recognizer.forceRelease())
+        synthesizer.cancelMomentum()
+    }
+
+    func cancelMomentum() {
+        synthesizer.cancelMomentum()
     }
 
     func stop() {
         heartbeat?.invalidate()
         heartbeat = nil
         releaseEverything()
+        synthesizer.stop()
     }
 
     private func emit(_ events: [GestureEvent]) {
@@ -185,10 +196,9 @@ final class TouchPipeline {
                 }
             }
 
-            if case .sessionEnded = event {
+            synthesizer.apply(event)
+            if case .sessionEnded = event, shouldReturnCursor {
                 cursorReturn.scheduleReturn(to: mainCentre)
-            } else {
-                synthesizer.apply(event)
             }
         }
     }

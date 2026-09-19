@@ -49,77 +49,66 @@ final class EventSynthesizer {
             releaseLeft(at: p)
 
         case .scroll(let dx, let dy, let centre):
-            // A scroll wheel event carries no location: macOS delivers it to whatever sits
-            // under the *pointer*. Two fingers never moved the pointer, so every scroll was
-            // being delivered to whatever window the cursor happened to be resting on —
-            // usually on the other display, which reads as "scrolling does nothing".
+            endMagnify()
+            cancelMomentum()
+            // A wheel event has no target location; route it to the touched window.
             moveCursor(to: centre)
-            postScroll(dx: dx, dy: dy)
+            recordScroll(dx: dx, dy: dy)
+            postScroll(dx: dx, dy: dy, scrollPhase: scrollActive ? 2 : 1)
+            scrollActive = true
 
         case .pinch(let scale, let centre):
+            finishTouchScroll(withMomentum: false)
+            cancelMomentum()
             moveCursor(to: centre)
-            postZoom(scale: scale)
+            postMagnify(scale: scale, at: centre)
 
         case .sessionEnded:
-            // Carrying a remainder into an unrelated later gesture can emit a step in the
-            // wrong direction on its first frame.
-            residualX = 0
-            residualY = 0
-            zoomResidual = 0
-            // The cursor is about to be warped home by CursorReturn, so a remembered
-            // position from this session would suppress a needed move in the next one.
+            endMagnify()
+            finishTouchScroll(withMomentum: true)
             lastCursorPoint = nil
         }
     }
 
-    /// How far the hand must open before one zoom step is sent, as a ratio. Each step is a
-    /// Command + `=` or Command + `-`, which is what View ▸ Zoom In / Zoom Out is bound to
-    /// in nearly every Mac app.
-    ///
-    /// There is no public CGEvent for a magnification gesture, so the choice is between
-    /// this and Command + scroll. Command + scroll is aimed at the window under the pointer,
-    /// which sounds better until an app that does not implement it scrolls the document
-    /// instead: the zoom gesture would move the page. A zoom keystroke an app does not
-    /// implement does nothing at all, which is the failure worth having.
-    private let zoomStep: CGFloat = 1.10
+    /// Quartz gesture events are not exposed as a public constructor. These fields follow
+    /// Touch Up's event format. Keep this isolated: the host macOS version must be tested
+    /// before treating it as a supported magnification path.
+    private var magnifyActive = false
+    private var lastMagnifyPoint: CGPoint = .zero
 
-    /// Ratios multiply, so they are accumulated in log space: two frames of 1.05 make one
-    /// step, and no single frame has to be large enough to trigger on its own.
-    private var zoomResidual: CGFloat = 0
-
-    private func postZoom(scale: CGFloat) {
+    private func postMagnify(scale: CGFloat, at point: CGPoint) {
         guard scale > 0, scale.isFinite else { return }
-
-        zoomResidual += CoreGraphics.log(scale)
-        let threshold = CoreGraphics.log(zoomStep)
-        guard threshold > 0, abs(zoomResidual) >= threshold else { return }
-
-        // A fast spread can cross several steps in one frame; send them all, or a quick
-        // gesture would be quietly clipped to a single step.
-        let steps = Int((abs(zoomResidual) / threshold).rounded(.towardZero))
-        let zoomingIn = zoomResidual > 0
-        zoomResidual -= CGFloat(steps) * threshold * (zoomingIn ? 1 : -1)
-
-        for _ in 0..<min(steps, 8) {
-            postKey(zoomingIn ? Self.equalsKey : Self.minusKey, flags: .maskCommand)
+        if !magnifyActive {
+            magnifyActive = true
+            lastMagnifyPoint = point
+            postMagnifyEvent(delta: 0, at: point, phase: 1) // began
+            log("🔎 Synthetic magnify began")
         }
+        lastMagnifyPoint = point
+        postMagnifyEvent(delta: Double(scale - 1), at: point, phase: 2) // changed
     }
 
-    /// ANSI key codes. Command + `=` rather than Command + `+`: the shift needed to reach
-    /// `+` changes what the app sees, and Zoom In is bound to the unshifted key.
-    private static let equalsKey: CGKeyCode = 24
-    private static let minusKey: CGKeyCode = 27
+    private func endMagnify() {
+        guard magnifyActive else { return }
+        postMagnifyEvent(delta: 0, at: lastMagnifyPoint, phase: 4) // ended
+        magnifyActive = false
+        log("🔎 Synthetic magnify ended")
+    }
 
-    private func postKey(_ key: CGKeyCode, flags: CGEventFlags) {
-        guard let down = CGEvent(keyboardEventSource: source, virtualKey: key, keyDown: true),
-              let up = CGEvent(keyboardEventSource: source, virtualKey: key, keyDown: false)
+    private func postMagnifyEvent(delta: Double, at point: CGPoint, phase: Int64) {
+        guard let event = CGEvent(source: nil),
+              let gestureType = CGEventType(rawValue: 29),
+              let subtype = CGEventField(rawValue: 110),
+              let phaseField = CGEventField(rawValue: 132),
+              let magnification = CGEventField(rawValue: 113)
         else { return }
 
-        down.flags = flags
-        down.post(tap: .cghidEventTap)
-        // Modifiers cleared on the way up, or the target app can be left holding Command.
-        up.flags = []
-        up.post(tap: .cghidEventTap)
+        event.type = gestureType
+        event.location = point
+        event.setIntegerValueField(subtype, value: 8)
+        event.setIntegerValueField(phaseField, value: phase)
+        event.setDoubleValueField(magnification, value: delta)
+        event.post(tap: .cghidEventTap)
     }
 
     /// Direct press/release, bypassing gesture classification. The on-screen keyboard uses
@@ -157,18 +146,116 @@ final class EventSynthesizer {
         event.post(tap: .cghidEventTap)
     }
 
-    /// Scroll wheel deltas are integers, but a slow two-finger drag produces sub-pixel
-    /// movement per frame. Rounding each frame independently would floor every one of them
-    /// to zero and the page would simply not move. Carry the remainder instead.
+    /// Scroll wheel deltas are integers. Keep the fractional remainder across frames.
     private var residualX: CGFloat = 0
     private var residualY: CGFloat = 0
+    private var scrollActive = false
+    private var scrollHistory: [(time: TimeInterval, point: CGPoint)] = []
+    private var scrollPosition = CGPoint.zero
+    private var lastScrollTime: TimeInterval = 0
+    private var momentumTimer: Timer?
+    private var momentumVelocity = CGPoint.zero
+    private var momentumStart: TimeInterval = 0
+    private var momentumLastTick: TimeInterval = 0
+    private var momentumHasBegun = false
 
-    private func postScroll(dx: CGFloat, dy: CGFloat) {
+    private func recordScroll(dx: CGFloat, dy: CGFloat) {
+        let now = ProcessInfo.processInfo.systemUptime
+        if !scrollActive {
+            scrollPosition = .zero
+            scrollHistory = [(now, .zero)]
+        }
+        scrollPosition.x += dx
+        scrollPosition.y += dy
+        scrollHistory.append((now, scrollPosition))
+        scrollHistory.removeAll { $0.time < now - 0.12 }
+        lastScrollTime = now
+    }
+
+    private func finishTouchScroll(withMomentum: Bool) {
+        guard scrollActive else { return }
+        postScroll(dx: 0, dy: 0, scrollPhase: 4, force: true)
+        scrollActive = false
+        defer {
+            scrollHistory.removeAll()
+            scrollPosition = .zero
+        }
+
+        guard withMomentum,
+              let first = scrollHistory.first,
+              let last = scrollHistory.last,
+              scrollHistory.count >= 3,
+              last.time - first.time >= 0.02,
+              ProcessInfo.processInfo.systemUptime - lastScrollTime < 0.08
+        else {
+            residualX = 0
+            residualY = 0
+            return
+        }
+
+        let interval = last.time - first.time
+        let vx = (last.point.x - first.point.x) / interval
+        let vy = (last.point.y - first.point.y) / interval
+        let speed = hypot(vx, vy)
+        guard speed.isFinite, speed > 100 else {
+            residualX = 0
+            residualY = 0
+            return
+        }
+        let limit: CGFloat = 3000
+        let ratio = min(1, limit / speed)
+        momentumVelocity = CGPoint(x: vx * ratio, y: vy * ratio)
+        momentumStart = ProcessInfo.processInfo.systemUptime
+        momentumLastTick = momentumStart
+        momentumHasBegun = false
+
+        let timer = Timer(timeInterval: 1.0 / 60.0, repeats: true) { [weak self] _ in
+            self?.advanceMomentum()
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        momentumTimer = timer
+    }
+
+    private func advanceMomentum() {
+        let now = ProcessInfo.processInfo.systemUptime
+        let dt = min(max(now - momentumLastTick, 0), 0.05)
+        momentumLastTick = now
+        let decay = pow(0.92, dt * 60)
+        momentumVelocity.x *= decay
+        momentumVelocity.y *= decay
+        if now - momentumStart >= 1.2 || hypot(momentumVelocity.x, momentumVelocity.y) < 40 {
+            cancelMomentum()
+            return
+        }
+        postScroll(dx: momentumVelocity.x * dt, dy: momentumVelocity.y * dt,
+                   momentumPhase: momentumHasBegun ? 2 : 1)
+        momentumHasBegun = true
+    }
+
+    /// A new touch, real mouse activity, disconnect, or shutdown ends momentum.
+    func cancelMomentum() {
+        guard let timer = momentumTimer else { return }
+        timer.invalidate()
+        momentumTimer = nil
+        if momentumHasBegun {
+            postScroll(dx: 0, dy: 0, momentumPhase: 3, force: true)
+        }
+        momentumHasBegun = false
+        momentumVelocity = .zero
+        residualX = 0
+        residualY = 0
+    }
+
+    func stop() {
+        finishTouchScroll(withMomentum: false)
+        cancelMomentum()
+        endMagnify()
+    }
+
+    private func postScroll(dx: CGFloat, dy: CGFloat, scrollPhase: Int64 = 0,
+                            momentumPhase: Int64 = 0, force: Bool = false) {
         residualX += dx
         residualY += dy
-
-        // A degenerate display rect can produce NaN, and Int32(NaN) traps — a crash here
-        // would abort the process while a mouse button may be held down.
         guard residualX.isFinite, residualY.isFinite else {
             residualX = 0
             residualY = 0
@@ -177,19 +264,20 @@ final class EventSynthesizer {
 
         let stepX = residualX.rounded(.towardZero)
         let stepY = residualY.rounded(.towardZero)
-        guard stepX != 0 || stepY != 0 else { return }
-
+        guard force || stepX != 0 || stepY != 0 else { return }
         residualX -= stepX
         residualY -= stepY
 
         let sign: Int32 = contentFollowsFinger ? 1 : -1
+        let maxDelta = CGFloat(Int32.max)
+        let x = Int32(min(max(stepX, -maxDelta), maxDelta))
+        let y = Int32(min(max(stepY, -maxDelta), maxDelta))
         guard let event = CGEvent(scrollWheelEvent2Source: source,
-                                  units: .pixel,
-                                  wheelCount: 2,
-                                  wheel1: sign * Int32(stepY),
-                                  wheel2: sign * Int32(stepX),
-                                  wheel3: 0) else { return }
+                                  units: .pixel, wheelCount: 2,
+                                  wheel1: sign * y, wheel2: sign * x, wheel3: 0) else { return }
+        event.setIntegerValueField(.scrollWheelEventIsContinuous, value: 1)
+        event.setIntegerValueField(.scrollWheelEventScrollPhase, value: scrollPhase)
+        event.setIntegerValueField(.scrollWheelEventMomentumPhase, value: momentumPhase)
         event.post(tap: .cghidEventTap)
     }
-
 }
