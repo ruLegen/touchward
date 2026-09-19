@@ -333,7 +333,7 @@ final class AppController: NSObject, NSApplicationDelegate {
         }
         self.pipeline = pipeline
         cursorReturn.onRealMouseActivity = { [weak pipeline] in
-            pipeline?.cancelMomentum()
+            pipeline?.noteRealMouseActivity()
         }
         pipeline.start()
     }

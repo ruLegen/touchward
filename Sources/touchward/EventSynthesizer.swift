@@ -1,3 +1,4 @@
+import AppKit
 import CoreGraphics
 import Foundation
 import TouchwardCore
@@ -12,6 +13,16 @@ final class EventSynthesizer {
     static let marker: Int64 = 0x5A_17C4
 
     private let source: CGEventSource
+
+    // macOS recognizes a double-click from the clickState field on the second
+    // down/up pair. Keep this separate from GestureRecognizer: each touch tap
+    // is already classified as one left click before it reaches this layer.
+    private var lastLeftClickTime: TimeInterval?
+    private var lastLeftClickPoint: CGPoint?
+    private var leftClickCount = 0
+    /// There is no public CGEvent setting for the spatial double-click tolerance.
+    /// Match the existing tap movement tolerance while using macOS for the timing.
+    private let doubleClickDistance: CGFloat = 10
 
     /// True when the finger's motion should carry the content with it, matching how a
     /// phone behaves. Flip this if scrolling feels inverted on your setup — it is the
@@ -32,14 +43,17 @@ final class EventSynthesizer {
     func apply(_ event: GestureEvent) {
         switch event {
         case .leftClick(let p):
-            post(.leftMouseDown, at: p, button: .left)
-            post(.leftMouseUp, at: p, button: .left)
+            let clickState = nextLeftClickState(at: p)
+            post(.leftMouseDown, at: p, button: .left, clickState: clickState)
+            post(.leftMouseUp, at: p, button: .left, clickState: clickState)
 
         case .rightClick(let p):
+            resetClickSequence()
             post(.rightMouseDown, at: p, button: .right)
             post(.rightMouseUp, at: p, button: .right)
 
         case .dragBegan(let p):
+            resetClickSequence()
             pressLeft(at: p)
 
         case .dragMoved(let p):
@@ -49,6 +63,7 @@ final class EventSynthesizer {
             releaseLeft(at: p)
 
         case .scroll(let dx, let dy, let centre):
+            resetClickSequence()
             endMagnify()
             cancelMomentum()
             // A wheel event has no target location; route it to the touched window.
@@ -58,6 +73,7 @@ final class EventSynthesizer {
             scrollActive = true
 
         case .pinch(let scale, let centre):
+            resetClickSequence()
             finishTouchScroll(withMomentum: false)
             cancelMomentum()
             moveCursor(to: centre)
@@ -115,11 +131,19 @@ final class EventSynthesizer {
     /// these: a key must go down the instant a finger lands and up when it leaves, with no
     /// tap-duration or movement test in between.
     func pressLeft(at point: CGPoint) {
+        resetClickSequence()
         post(.leftMouseDown, at: point, button: .left)
     }
 
     func releaseLeft(at point: CGPoint) {
         post(.leftMouseUp, at: point, button: .left)
+    }
+
+    /// Real mouse activity takes over pointer ownership and must not be combined
+    /// with a pending touchscreen double-click sequence.
+    func noteRealMouseActivity() {
+        resetClickSequence()
+        cancelMomentum()
     }
 
     /// Parks the pointer without pressing anything, so a location-less event (the scroll
@@ -132,18 +156,52 @@ final class EventSynthesizer {
         post(.mouseMoved, at: point, button: .left)
     }
 
-    private func post(_ type: CGEventType, at point: CGPoint, button: CGMouseButton) {
+    private func post(_ type: CGEventType, at point: CGPoint, button: CGMouseButton,
+                      clickState: Int64? = nil) {
         guard let event = CGEvent(mouseEventSource: source, mouseType: type,
                                   mouseCursorPosition: point, mouseButton: button) else { return }
         // Apps that gate on clickCount >= 1 (custom text views, web content) ignore a
-        // click that arrives with 0.
+        // click that arrives with 0. For a touchscreen double-click, both events in the
+        // second down/up pair must carry clickState=2.
         switch type {
         case .leftMouseDown, .leftMouseUp, .rightMouseDown, .rightMouseUp:
-            event.setIntegerValueField(.mouseEventClickState, value: 1)
+            event.setIntegerValueField(.mouseEventClickState, value: clickState ?? 1)
         default:
             break
         }
         event.post(tap: .cghidEventTap)
+    }
+
+    private func nextLeftClickState(at point: CGPoint) -> Int64 {
+        let now = ProcessInfo.processInfo.systemUptime
+        let canContinue = lastLeftClickTime.map { now - $0 <= NSEvent.doubleClickInterval } == true
+            && lastLeftClickPoint.map { distance($0, point) <= doubleClickDistance } == true
+
+        if canContinue {
+            // Preserve normal macOS triple-click semantics, but avoid unbounded growth
+            // when a panel reports repeated taps without a pause.
+            leftClickCount = min(leftClickCount + 1, 3)
+        } else {
+            leftClickCount = 1
+        }
+
+        lastLeftClickTime = now
+        lastLeftClickPoint = point
+        let state = Int64(leftClickCount)
+        log("🖱️ synthetic left clickState=\(state) at (\(Int(point.x)),\(Int(point.y)))")
+        return state
+    }
+
+    private func resetClickSequence() {
+        lastLeftClickTime = nil
+        lastLeftClickPoint = nil
+        leftClickCount = 0
+    }
+
+    private func distance(_ a: CGPoint, _ b: CGPoint) -> CGFloat {
+        let dx = a.x - b.x
+        let dy = a.y - b.y
+        return (dx * dx + dy * dy).squareRoot()
     }
 
     /// Scroll wheel deltas are integers. Keep the fractional remainder across frames.

@@ -180,6 +180,10 @@ final class TouchPipeline {
         synthesizer.cancelMomentum()
     }
 
+    func noteRealMouseActivity() {
+        synthesizer.noteRealMouseActivity()
+    }
+
     func stop() {
         heartbeat?.invalidate()
         heartbeat = nil
