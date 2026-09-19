@@ -108,7 +108,7 @@ final class AppController: NSObject, NSApplicationDelegate {
     private var hasRequestedPermissions = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        log("▶️  Touchward starting. \(Permissions.describe())")
+        log("▶️  Touchward starting pid=\(ProcessInfo.processInfo.processIdentifier). \(Permissions.describe())")
 
         // Accessibility is asked for up front: its prompt is cheap and non-blocking.
         if !Permissions.accessibilityGranted {
@@ -243,10 +243,8 @@ final class AppController: NSObject, NSApplicationDelegate {
 
         // Unplugging mid-drag would otherwise leave the left button logically pressed.
         device.onDisconnect = { [weak self] in
-            DispatchQueue.main.async {
-                log("🔌 Touchscreen unplugged. Releasing anything held down.")
-                self?.deactivate()
-            }
+            log("🔌 Touchscreen unplugged. Releasing anything held down.")
+            self?.deactivate()
         }
 
         DisplayRegistry.onReconfiguration { [weak self] in
@@ -289,6 +287,7 @@ final class AppController: NSObject, NSApplicationDelegate {
         hasReportedNoDisplay = false
 
         guard pipeline == nil else { return }
+        log("🔄 Activating touch session pid=\(ProcessInfo.processInfo.processIdentifier).")
         log("🖥  Touch display: \(touchDisplay) bounds \(CGDisplayBounds(touchDisplay))")
 
         // The device is started first: everything downstream is sized from what it
@@ -328,8 +327,12 @@ final class AppController: NSObject, NSApplicationDelegate {
                                            touchDisplay: touchDisplay,
                                            mainDisplay: mainDisplay,
                                            cursorReturn: cursorReturn) else {
-            log("❌ Could not create a CGEventSource.")
-            exit(1)
+            if !hasReportedPipelineFailure {
+                log("❌ Could not create a CGEventSource; keeping the app alive and retrying.")
+                hasReportedPipelineFailure = true
+            }
+            device.stop()
+            return
         }
         self.pipeline = pipeline
         wireKeyboard(to: pipeline)
@@ -337,6 +340,9 @@ final class AppController: NSObject, NSApplicationDelegate {
             pipeline?.noteRealMouseActivity()
         }
         pipeline.start()
+        activationTicks = 0
+        hasReportedPipelineFailure = false
+        log("✅ Touch session active pid=\(ProcessInfo.processInfo.processIdentifier).")
     }
 
     /// Puts the touch side back to sleep and lets it be started again.
@@ -346,6 +352,10 @@ final class AppController: NSObject, NSApplicationDelegate {
     /// the old one is also what stopped a replug from ever reactivating, since activation
     /// skips itself while a pipeline exists.
     private func deactivate() {
+        let hadSession = pipeline != nil || device.isRunning || isTouchDisplayActive || touchDisplayID != nil
+        guard hadSession else { return }
+
+        log("⏹️ Deactivating touch session pid=\(ProcessInfo.processInfo.processIdentifier).")
         pipeline?.stop()
         pipeline = nil
         cursorReturn.onRealMouseActivity = nil
@@ -353,10 +363,12 @@ final class AppController: NSObject, NSApplicationDelegate {
         panel?.dismiss()
         isTouchDisplayActive = false
         touchDisplayID = nil
+        log("⏹️ Touch session deactivated; waiting for the display/device.")
     }
 
     private var hasReportedNoDisplay = false
     private var hasReportedNoDevice = false
+    private var hasReportedPipelineFailure = false
     private var activationTicks = 0
 
     /// A held drag must not survive the process. Ctrl-C is the documented way to quit, and
@@ -425,6 +437,9 @@ final class AppController: NSObject, NSApplicationDelegate {
         // covering the bottom of a monitor that has no touchscreen at all.
         if touch == nil {
             panel?.dismiss()
+            if pipeline != nil || device.isRunning {
+                deactivate()
+            }
         }
         return touch
     }

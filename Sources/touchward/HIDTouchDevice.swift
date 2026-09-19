@@ -30,6 +30,8 @@ final class HIDTouchDevice {
     private var openOptionsByDevice: [IOOptionBits] = []
     private var assembler = TouchValueAssembler()
     private var onFrame: ((TouchFrame) -> Void)?
+    private(set) var isRunning = false
+    private var removalHandlingScheduled = false
 
     private(set) var isSeized = false
     private(set) var seizedInterfaces = 0
@@ -43,6 +45,11 @@ final class HIDTouchDevice {
     var onDisconnect: (() -> Void)?
 
     func start(onFrame: @escaping (TouchFrame) -> Void) -> Result<DeviceProfile, StartError> {
+        guard manager == nil, devices.isEmpty, !isRunning else {
+            return .failure(.alreadyRunning)
+        }
+
+        resetSessionState()
         self.onFrame = onFrame
 
         let manager = IOHIDManagerCreate(kCFAllocatorDefault, IOOptionBits(kIOHIDOptionsTypeNone))
@@ -55,33 +62,22 @@ final class HIDTouchDevice {
             kIOHIDDeviceUsageKey: Usage.touchScreen,
         ] as CFDictionary)
 
-        // Enumerate WITHOUT opening the manager.
-        //
-        // IOHIDManagerOpen opens every matched device shared, through the same user
-        // client. A later IOHIDDeviceOpen(…Seize) on that same client hits IOKit's
-        // "multiple opens" guard, which returns success but never records the seize — so
-        // the device stays shared, macOS keeps driving the pointer from it, and the log
-        // cheerfully reports a seize that never happened. Matching alone is enough to
-        // enumerate; the one and only open is the seize below.
-        guard let found = IOHIDManagerCopyDevices(manager) as? Set<IOHIDDevice>,
-              let device = found.first else {
-            let opened = IOHIDManagerOpen(manager, IOOptionBits(kIOHIDOptionsTypeSeizeDevice))
-            guard opened == kIOReturnSuccess else { return .failure(.managerOpenFailed(opened)) }
-            guard let retry = IOHIDManagerCopyDevices(manager) as? Set<IOHIDDevice>,
-                  let device = retry.first else { return .failure(.deviceNotFound) }
-            guard let profile = attach(device) else { return .failure(.unreadableDescriptor) }
-            self.profile = profile
-            return .success(profile)
-        }
-
+        // Register and schedule the manager before attaching a device. Cleanup is always
+        // performed after the removal callback returns, never from inside that callback.
         IOHIDManagerRegisterDeviceRemovalCallback(manager, { context, _, _, _ in
             guard let context else { return }
             Unmanaged<HIDTouchDevice>.fromOpaque(context).takeUnretainedValue().handleRemoval()
         }, Unmanaged.passUnretained(self).toOpaque())
-
-        // The manager needs its own run-loop scheduling: per-device scheduling below only
-        // delivers input, never the removal callback.
         IOHIDManagerScheduleWithRunLoop(manager, CFRunLoopGetMain(), CFRunLoopMode.commonModes.rawValue)
+        isRunning = true
+
+        // Matching is enough to enumerate. If there is no device yet, stop this manager
+        // cleanly and let AppController retry from its normal polling path.
+        guard let found = IOHIDManagerCopyDevices(manager) as? Set<IOHIDDevice>,
+              let device = found.first else {
+            stop()
+            return .failure(.deviceNotFound)
+        }
 
         // If a panel splits its collections across several interfaces, the one carrying
         // Input Mode may not be the one we opened — worth knowing before blaming the write.
@@ -89,7 +85,10 @@ final class HIDTouchDevice {
             log("ℹ️  \(found.count) devices declare Digitizer/Touch Screen; using the first.")
         }
 
-        guard let profile = attach(device) else { return .failure(.unreadableDescriptor) }
+        guard let profile = attach(device) else {
+            stop()
+            return .failure(.unreadableDescriptor)
+        }
         self.profile = profile
         return .success(profile)
     }
@@ -228,6 +227,7 @@ final class HIDTouchDevice {
     }
 
     private func handle(_ value: IOHIDValue) {
+        guard isRunning else { return }
         let element = IOHIDValueGetElement(value)
         let page = Int(IOHIDElementGetUsagePage(element))
         let usage = Int(IOHIDElementGetUsage(element))
@@ -309,6 +309,7 @@ final class HIDTouchDevice {
     }
 
     private func deliver(_ frame: TouchFrame) {
+        guard isRunning else { return }
         framesEmitted += 1
         if framesEmitted <= 12 || frame.contacts.count >= 2 && framesEmitted <= 60 {
             let detail = frame.contacts
@@ -420,17 +421,38 @@ final class HIDTouchDevice {
     }
 
     private func handleRemoval() {
-        onDisconnect?()
-        stop()
+        guard isRunning, !removalHandlingScheduled else { return }
+        removalHandlingScheduled = true
+        log("🔌 HID removal callback received; deferring cleanup until the callback returns.")
+
+        let disconnect = onDisconnect
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            if let disconnect {
+                disconnect()
+            } else {
+                self.stop()
+            }
+            self.removalHandlingScheduled = false
+        }
     }
 
-    /// Unschedules, closes and frees everything. Safe to call twice.
+    /// Unschedules, closes and frees everything. Safe to call twice and never called
+    /// synchronously from IOHIDManager's removal callback.
     func stop() {
+        let hadResources = isRunning || manager != nil || !devices.isEmpty || pendingSlotTime != nil
+        guard hadResources else {
+            resetSessionState()
+            return
+        }
+
+        // Stop delivery first. Late values from the removed device must not reach a new
+        // pipeline while the old IOHID objects are being torn down.
+        isRunning = false
+        onFrame = nil
         slotFlush?.invalidate()
         slotFlush = nil
         pendingSlotTime = nil
-        // The panel will never send the tip-switch release once it is gone; without this
-        // the next session would start with phantom fingers still down.
         tracker.releaseAll()
 
         for (index, device) in devices.enumerated() {
@@ -440,19 +462,40 @@ final class HIDTouchDevice {
                              ? openOptionsByDevice[index]
                              : IOOptionBits(kIOHIDOptionsTypeNone))
         }
-        devices.removeAll()
-        openOptionsByDevice.removeAll()
 
         if let manager {
             IOHIDManagerRegisterDeviceRemovalCallback(manager, nil, nil)
             IOHIDManagerUnscheduleFromRunLoop(manager, CFRunLoopGetMain(), CFRunLoopMode.commonModes.rawValue)
             IOHIDManagerClose(manager, IOOptionBits(kIOHIDOptionsTypeNone))
         }
+
+        resetSessionState()
+    }
+
+    private func resetSessionState() {
         manager = nil
+        devices.removeAll()
+        openOptionsByDevice.removeAll()
+        fingerFields.removeAll()
+        assembler = TouchValueAssembler()
+        tracker = SlotTracker()
+        pendingSlotTime = nil
+        slotFlush = nil
+        onFrame = nil
+        isRunning = false
+        removalHandlingScheduled = false
+        isSeized = false
+        seizedInterfaces = 0
+        valuesSeen = 0
+        digitizerValuesSeen = 0
+        framesEmitted = 0
+        inputModeSet = false
+        profile = nil
     }
 
     enum StartError: Error, CustomStringConvertible {
         case managerOpenFailed(IOReturn)
+        case alreadyRunning
         case deviceNotFound
         case unreadableDescriptor
 
@@ -466,6 +509,8 @@ final class HIDTouchDevice {
                 """
             case .managerOpenFailed(let code):
                 return "Could not open IOHIDManager (code \(String(format: "0x%08x", code)))."
+            case .alreadyRunning:
+                return "The HID device session is already running."
             case .deviceNotFound:
                 return "No device declares itself a Digitizer/Touch Screen. Check the USB cable."
             case .unreadableDescriptor:
