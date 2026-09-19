@@ -12,16 +12,26 @@ final class TouchPipeline {
     private var mainCentre: CGPoint
     private var shouldReturnCursor: Bool
     private var heartbeat: Timer?
+    private var lastFrameAt: TimeInterval = 0
+    /// HID is change-driven, so a resting finger sends no reports. This is only a
+    /// last-resort release for a dead stream; ordinary lifts still use the zero-contact frame.
+    private let keyboardStaleTimeout: TimeInterval = 5.0
 
     /// Global-coordinate rect of the on-screen keyboard while it is visible.
     /// Touches inside it bypass gesture classification entirely.
     var directTouchRegion: (() -> CGRect?)?
     /// Presses the key under a global point; returns true when a key was actually hit.
     /// Injected rather than synthesized as a click so typing never moves the pointer.
-    var pressKey: ((CGPoint) -> Bool)?
-    /// The finger left the keyboard.
-    var releaseKey: (() -> Void)?
-    private var directPress: CGPoint?
+    var pressKey: ((UInt8, CGPoint) -> Bool)?
+    /// Moves a contact to a new key for slide typing.
+    var moveKey: ((UInt8, CGPoint) -> Bool)?
+    /// Releases the key owned by one contact ID.
+    var releaseKey: ((UInt8) -> Void)?
+    /// The keyboard can have one independently held key per HID contact.
+    private var directPresses: [UInt8: CGPoint] = [:]
+    private var keyboardTouchActive = false
+    /// Lets a same-frame Shift contact be processed before character contacts.
+    var isModifierKey: ((CGPoint) -> Bool)?
 
     private let profile: DeviceProfile
 
@@ -48,8 +58,15 @@ final class TouchPipeline {
     func start() {
         heartbeat?.invalidate()
         let timer = Timer(timeInterval: 0.05, repeats: true) { [weak self] _ in
-            guard let self, self.recognizer.hasActiveGesture else { return }
-            self.emit(self.recognizer.tick(at: Clock.now()))
+            guard let self else { return }
+            let now = Clock.now()
+            if self.keyboardTouchActive,
+               now - self.lastFrameAt > self.keyboardStaleTimeout {
+                log("⚠️ Keyboard touch stream timed out — releasing held keys.")
+                self.finishKeyboardTouch()
+            }
+            guard self.recognizer.hasActiveGesture else { return }
+            self.emit(self.recognizer.tick(at: now))
         }
         // Common mode: in default mode the heartbeat stalls while a control in our own
         // keyboard panel is tracking — exactly when a held button most needs the backstop.
@@ -94,6 +111,7 @@ final class TouchPipeline {
 
     func handle(_ raw: TouchFrame) {
         guard !isSuspended else { return }
+        lastFrameAt = Clock.now()
 
         let frame = palmFilter.reject(raw)
 
@@ -130,54 +148,95 @@ final class TouchPipeline {
     /// Returns true when the frame was consumed as a key press.
     private func handleDirectTouch(_ frame: MappedFrame) -> Bool {
         guard let region = directTouchRegion?() else {
-            releaseDirectPress()
+            finishKeyboardTouch()
             return false
         }
 
-        if directPress == nil {
-            // Never hijack a gesture already in flight elsewhere on the screen.
+        if !keyboardTouchActive {
+            // Do not steal a pointer gesture that is already in flight. A keyboard
+            // capture starts only when the complete first frame is on the panel.
             guard !recognizer.hasActiveGesture,
-                  frame.contacts.count == 1,
-                  let contact = frame.contacts.first,
-                  region.contains(contact.point) else { return false }
+                  !frame.contacts.isEmpty,
+                  frame.contacts.allSatisfy({ region.contains($0.point) }) else { return false }
+            keyboardTouchActive = true
+            log("⌨︎ Keyboard capture began for (frame.contacts.count) contact(s).")
+        }
 
-            _ = pressKey?(contact.point)
-            directPress = contact.point
-            // Consumed either way: a finger inside the keyboard that landed between keys
-            // must not fall through and click whatever sits behind the panel.
+        if frame.contacts.isEmpty {
+            finishKeyboardTouch()
             return true
         }
 
-        if let contact = frame.contacts.first(where: { region.contains($0.point) }) {
-            directPress = contact.point
-            return true
+        let currentIDs = Set(frame.contacts.map(\.id))
+        let removedIDs = directPresses.keys.filter { !currentIDs.contains($0) }
+        for id in removedIDs {
+            log("⌨︎ Keyboard contact up id=\(id)")
+            releaseKey?(id)
+            directPresses.removeValue(forKey: id)
         }
 
-        releaseDirectPress()
+        // Leaving the panel releases that key, but the keyboard capture remains active
+        // until all contacts are gone so a finger cannot fall through to the desktop.
+        for contact in frame.contacts where !region.contains(contact.point) {
+            if directPresses.removeValue(forKey: contact.id) != nil {
+                log("⌨︎ Keyboard contact left panel id=\(contact.id)")
+                releaseKey?(contact.id)
+            }
+        }
+
+        let newContacts = frame.contacts
+            .filter { region.contains($0.point) && directPresses[$0.id] == nil }
+            .sorted { lhs, rhs in
+                let leftModifier = isModifierKey?(lhs.point) ?? false
+                let rightModifier = isModifierKey?(rhs.point) ?? false
+                return leftModifier && !rightModifier
+            }
+
+        for contact in newContacts {
+            log("⌨︎ Keyboard contact down id=\(contact.id)")
+            _ = pressKey?(contact.id, contact.point)
+            // Keep contacts that landed between keys so slide typing can enter a key
+            // when the finger moves onto it later.
+            directPresses[contact.id] = contact.point
+        }
+
+        for contact in frame.contacts where region.contains(contact.point) {
+            guard let previous = directPresses[contact.id] else { continue }
+            guard previous != contact.point else { continue }
+            _ = moveKey?(contact.id, contact.point)
+            directPresses[contact.id] = contact.point
+        }
+
         return true
     }
 
-    private func releaseDirectPress() {
-        guard directPress != nil else { return }
-        releaseKey?()
-        directPress = nil
-        // The keyboard swallows these frames, so the recognizer never reaches
-        // `sessionEnded` and nothing else would ever arm the return. Without this, one tap
-        // on a key stranded the cursor on the touchscreen for the rest of the session.
-        if shouldReturnCursor { cursorReturn.scheduleReturn(to: mainCentre) }
+    private func finishKeyboardTouch() {
+        let wasActive = keyboardTouchActive || !directPresses.isEmpty
+        if wasActive { log("⌨︎ Keyboard capture ended; releasing (directPresses.count) contact(s).") }
+        let ids = Array(directPresses.keys)
+        for id in ids { releaseKey?(id) }
+        directPresses.removeAll()
+        keyboardTouchActive = false
+        if wasActive && shouldReturnCursor {
+            cursorReturn.scheduleReturn(to: mainCentre)
+        }
     }
 
     /// Closes out anything in flight. Called on quit, on unplug, and on sleep, so a pointer
     /// button is never left logically pressed for the rest of the login session.
     func releaseEverything() {
-        // A key may still be under a finger; let it go on quit and on unplug.
-        releaseDirectPress()
+        // Keys may still be under several fingers; let them all go on quit and unplug.
+        finishKeyboardTouch()
         emit(recognizer.forceRelease())
         synthesizer.cancelMomentum()
     }
 
     func cancelMomentum() {
         synthesizer.cancelMomentum()
+    }
+
+    func releaseKeyboardTouches() {
+        finishKeyboardTouch()
     }
 
     func noteRealMouseActivity() {

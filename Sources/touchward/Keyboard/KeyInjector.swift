@@ -11,6 +11,11 @@ import Foundation
 /// Vietnamese diacritics and emoji work when the layout has no key for them.
 final class KeyInjector {
     private let source: CGEventSource?
+    private var heldKeyCounts: [CGKeyCode: Int] = [:]
+    private var repeatKey: CGKeyCode?
+    private var repeatFlags: CGEventFlags = []
+    private var repeatDelayTimer: Timer?
+    private var repeatTimer: Timer?
 
     init() {
         source = CGEventSource(stateID: .hidSystemState)
@@ -33,16 +38,83 @@ final class KeyInjector {
     }
 
     func sendKey(_ keyCode: CGKeyCode, flags: CGEventFlags = []) {
-        guard let down = CGEvent(keyboardEventSource: source, virtualKey: keyCode, keyDown: true),
-              let up = CGEvent(keyboardEventSource: source, virtualKey: keyCode, keyDown: false)
-        else { return }
+        postKeyDown(keyCode, flags: flags)
+        postKeyUp(keyCode)
+    }
 
-        down.flags = flags
-        down.post(tap: .cghidEventTap)
+    /// Holds a physical key down. Repeatable keys receive additional keyDown events
+    /// after the normal macOS delay until releaseKey is called.
+    func pressKey(_ keyCode: CGKeyCode, flags: CGEventFlags = [], repeatable: Bool = false) {
+        let count = heldKeyCounts[keyCode, default: 0]
+        heldKeyCounts[keyCode] = count + 1
+        guard count == 0 else { return }
 
+        postKeyDown(keyCode, flags: flags)
+        if repeatable {
+            repeatKey = keyCode
+            repeatFlags = flags
+            scheduleRepeat()
+        }
+    }
+
+    func releaseKey(_ keyCode: CGKeyCode) {
+        guard let count = heldKeyCounts[keyCode] else { return }
+        if count > 1 {
+            heldKeyCounts[keyCode] = count - 1
+            return
+        }
+        heldKeyCounts.removeValue(forKey: keyCode)
+        postKeyUp(keyCode)
+        if repeatKey == keyCode { stopRepeat() }
+    }
+
+    func releaseAllKeys() {
+        let keys = Array(heldKeyCounts.keys)
+        heldKeyCounts.removeAll()
+        stopRepeat()
+        for key in keys { postKeyUp(key) }
+    }
+
+    private func postKeyDown(_ keyCode: CGKeyCode, flags: CGEventFlags = []) {
+        guard let event = CGEvent(keyboardEventSource: source, virtualKey: keyCode, keyDown: true) else { return }
+        event.flags = flags
+        event.post(tap: .cghidEventTap)
+    }
+
+    private func postKeyUp(_ keyCode: CGKeyCode) {
         // Clear modifiers on the way up or the target app can see a stuck modifier.
-        up.flags = []
-        up.post(tap: .cghidEventTap)
+        guard let event = CGEvent(keyboardEventSource: source, virtualKey: keyCode, keyDown: false) else { return }
+        event.flags = []
+        event.post(tap: .cghidEventTap)
+    }
+
+    private func scheduleRepeat() {
+        repeatDelayTimer?.invalidate()
+        let timer = Timer(timeInterval: 0.45, repeats: false) { [weak self] _ in
+            self?.beginRepeat()
+        }
+        repeatDelayTimer = timer
+        RunLoop.main.add(timer, forMode: .common)
+    }
+
+    private func beginRepeat() {
+        repeatDelayTimer = nil
+        guard repeatKey != nil else { return }
+        let timer = Timer(timeInterval: 0.055, repeats: true) { [weak self] _ in
+            guard let self, let repeatKey = self.repeatKey else { return }
+            self.postKeyDown(repeatKey, flags: self.repeatFlags)
+        }
+        repeatTimer = timer
+        RunLoop.main.add(timer, forMode: .common)
+    }
+
+    private func stopRepeat() {
+        repeatDelayTimer?.invalidate()
+        repeatDelayTimer = nil
+        repeatTimer?.invalidate()
+        repeatTimer = nil
+        repeatKey = nil
+        repeatFlags = []
     }
 
     private func sendUnicode(_ string: String) {

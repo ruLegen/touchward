@@ -60,6 +60,7 @@ final class KeyboardView: NSView {
     }
 
     private let injector: KeyInjector
+    private let soundPlayer = KeyboardSoundPlayer()
     private var plane: Plane = .letters
     private var shift: ShiftState = .off
     private var lastShiftTap: TimeInterval = 0
@@ -216,8 +217,11 @@ final class KeyboardView: NSView {
 
     // MARK: input
 
-    /// The key a finger is resting on, so the release knows what to un-press.
-    private weak var touchedKey: KeyButton?
+    /// Each HID contact owns one key independently. This is what allows Shift+letter
+    /// and two simultaneous letters without one finger releasing the other.
+    private var touchedKeys: [UInt8: KeyButton] = [:]
+    private var heldShiftContacts = Set<UInt8>()
+    private var shiftWasUsedWhileHeld = false
 
     /// Presses whatever key sits under a point in the global, top-left-origin space that
     /// CGEvent and the touch mapper use. Returns true when a key was hit.
@@ -226,22 +230,58 @@ final class KeyboardView: NSView {
     /// no longer drags the pointer onto the touchscreen: a synthetic `leftMouseDown` *is* a
     /// cursor move.
     @discardableResult
-    func pressKey(atGlobalPoint point: CGPoint) -> Bool {
-        releaseKey()
+    func pressKey(contactID: UInt8, atGlobalPoint point: CGPoint) -> Bool {
         guard let button = key(atGlobalPoint: point), button.isEnabled else { return false }
 
-        touchedKey = button
-        button.isPressed = true
-        // Fire on touch-down. On glass there is no way to slide off a key to cancel, and
-        // waiting for the lift makes every keystroke feel late.
-        perform(button.key)
+        if let current = touchedKeys[contactID] {
+            if current === button { return true }
+            releaseKey(contactID: contactID)
+        }
+
+        touchedKeys[contactID] = button
+        button.press(for: contactID)
+        perform(button.key, contactID: contactID)
+        soundPlayer.play()
         return true
     }
 
-    /// The finger left the glass. Only clears the highlight — the key fired on the way down.
-    func releaseKey() {
-        touchedKey?.isPressed = false
-        touchedKey = nil
+    @discardableResult
+    func moveKey(contactID: UInt8, atGlobalPoint point: CGPoint) -> Bool {
+        guard let button = key(atGlobalPoint: point), button.isEnabled else {
+            releaseKey(contactID: contactID)
+            return false
+        }
+        if touchedKeys[contactID] === button { return true }
+        releaseKey(contactID: contactID)
+        return pressKey(contactID: contactID, atGlobalPoint: point)
+    }
+
+    func releaseKey(contactID: UInt8) {
+        guard let button = touchedKeys.removeValue(forKey: contactID) else { return }
+        button.release(for: contactID)
+        switch button.key.action {
+        case .delete:
+            injector.releaseKey(CGKeyCode(kVK_Delete))
+        case .shift:
+            releaseShift(contactID: contactID)
+        default:
+            break
+        }
+    }
+
+    func releaseAllKeys() {
+        let ids = Array(touchedKeys.keys)
+        for id in ids { releaseKey(contactID: id) }
+        touchedKeys.removeAll()
+        heldShiftContacts.removeAll()
+        shiftWasUsedWhileHeld = false
+        injector.releaseAllKeys()
+    }
+
+    func isModifierKey(atGlobalPoint point: CGPoint) -> Bool {
+        guard let button = key(atGlobalPoint: point) else { return false }
+        if case .shift = button.key.action { return true }
+        return false
     }
 
     private func key(atGlobalPoint point: CGPoint) -> KeyButton? {
@@ -257,30 +297,55 @@ final class KeyboardView: NSView {
 
     @objc private func keyTapped(_ sender: KeyButton) {
         perform(sender.key)
+        soundPlayer.play()
     }
 
-    private func perform(_ key: Key) {
+    private func perform(_ key: Key, contactID: UInt8? = nil) {
         switch key.action {
         case .character(let plain, let shifted):
+            let heldShift = !heldShiftContacts.isEmpty
             injector.type(shift.isUp ? shifted : plain)
-            if shift == .oneShot {
+            if heldShift && shift == .oneShot {
+                shiftWasUsedWhileHeld = true
+            } else if !heldShift && shift == .oneShot {
                 shift = .off
                 refreshTitles()
             }
 
         case .shift:
-            let now = Date().timeIntervalSinceReferenceDate
-            // A second tap inside the double-tap window locks it, as on iPadOS.
-            if shift.isUp, now - lastShiftTap < 0.4 {
-                shift = .locked
-            } else {
-                shift = shift.isUp ? .off : .oneShot
+            guard let contactID else {
+                let now = Date().timeIntervalSinceReferenceDate
+                // A second tap inside the double-tap window locks it, as on iPadOS.
+                if shift.isUp, now - lastShiftTap < 0.4 {
+                    shift = .locked
+                } else {
+                    shift = shift.isUp ? .off : .oneShot
+                }
+                lastShiftTap = now
+                refreshTitles()
+                return
             }
-            lastShiftTap = now
+
+            let now = Date().timeIntervalSinceReferenceDate
+            let wasAlreadyHeld = !heldShiftContacts.isEmpty
+            if !wasAlreadyHeld {
+                if shift.isUp, now - lastShiftTap < 0.4 {
+                    shift = .locked
+                } else {
+                    shift = shift.isUp ? .off : .oneShot
+                }
+                lastShiftTap = now
+                shiftWasUsedWhileHeld = false
+            }
+            heldShiftContacts.insert(contactID)
             refreshTitles()
 
         case .delete:
-            injector.sendKey(CGKeyCode(kVK_Delete))
+            if contactID != nil {
+                injector.pressKey(CGKeyCode(kVK_Delete), repeatable: true)
+            } else {
+                injector.sendKey(CGKeyCode(kVK_Delete))
+            }
 
         case .newline:
             injector.sendKey(CGKeyCode(kVK_Return))
@@ -301,6 +366,16 @@ final class KeyboardView: NSView {
         }
     }
 
+    private func releaseShift(contactID: UInt8) {
+        heldShiftContacts.remove(contactID)
+        guard heldShiftContacts.isEmpty,
+              shift == .oneShot,
+              shiftWasUsedWhileHeld else { return }
+        shift = .off
+        shiftWasUsedWhileHeld = false
+        refreshTitles()
+    }
+
     private func refreshTitles() {
         for button in buttons {
             button.render(shifted: shift.isUp, shiftState: shift)
@@ -315,6 +390,17 @@ final class KeyButton: NSButton {
 
     var isPressed = false {
         didSet { needsDisplay = true; updateColors() }
+    }
+    private var pressedContacts = Set<UInt8>()
+
+    func press(for contactID: UInt8) {
+        pressedContacts.insert(contactID)
+        isPressed = true
+    }
+
+    func release(for contactID: UInt8) {
+        pressedContacts.remove(contactID)
+        isPressed = !pressedContacts.isEmpty
     }
 
     init(key: KeyboardView.Key, target: AnyObject, action: Selector) {

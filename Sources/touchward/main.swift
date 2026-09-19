@@ -332,6 +332,7 @@ final class AppController: NSObject, NSApplicationDelegate {
             exit(1)
         }
         self.pipeline = pipeline
+        wireKeyboard(to: pipeline)
         cursorReturn.onRealMouseActivity = { [weak pipeline] in
             pipeline?.noteRealMouseActivity()
         }
@@ -455,20 +456,6 @@ final class AppController: NSObject, NSApplicationDelegate {
             panel?.setMinimized(false)
         }
 
-        // Touches landing on the keyboard bypass gesture classification entirely.
-        pipeline?.directTouchRegion = { [weak panel] in
-            guard let panel, panel.isVisible else { return nil }
-            return panel.cgFrame
-        }
-        // The key is driven straight from the touch point. Synthesizing a click instead
-        // would move the pointer onto the keyboard on every keystroke.
-        pipeline?.pressKey = { [weak surface] point in
-            surface?.pressKey(atGlobalPoint: point) ?? false
-        }
-        pipeline?.releaseKey = { [weak surface] in
-            surface?.releaseKey()
-        }
-
         focusWatcher.start { [weak self] focus in
             // Read the display ID fresh rather than capturing it: replugging the panel
             // mints a new CGDirectDisplayID, and a captured stale one silently resolves to
@@ -478,6 +465,7 @@ final class AppController: NSObject, NSApplicationDelegate {
             // Dismissal must not depend on finding the screen: if the panel is unplugged
             // while the keyboard is up, a later non-text focus still has to put it away.
             guard focus.isTextInput else {
+                self.pipeline?.releaseKeyboardTouches()
                 panel.dismiss()
                 return
             }
@@ -485,6 +473,7 @@ final class AppController: NSObject, NSApplicationDelegate {
             // away between the focus change and this line.
             guard let displayID = self.evaluateTouchDisplay(),
                   let screen = NSScreen.matching(displayID: displayID) else {
+                self.pipeline?.releaseKeyboardTouches()
                 panel.dismiss()
                 return
             }
@@ -493,6 +482,7 @@ final class AppController: NSObject, NSApplicationDelegate {
             // front of it. Throwing an on-screen keyboard onto the touch panel for it is
             // pure noise — this is why focusing a chat on the main display used to raise it.
             guard self.isOnTouchDisplay(focus.bounds, displayID: displayID) else {
+                self.pipeline?.releaseKeyboardTouches()
                 panel.dismiss()
                 return
             }
@@ -504,6 +494,32 @@ final class AppController: NSObject, NSApplicationDelegate {
 
         // Runs for the life of the app, not only while the keyboard is up.
         startFocusPolling()
+    }
+
+    /// Connects the current keyboard surface to a newly-created touch pipeline.
+    /// The pipeline can be recreated after unplug/replug, so this must run after its
+    /// construction every time rather than only during keyboard window setup.
+    private func wireKeyboard(to pipeline: TouchPipeline) {
+        let panel = self.panel
+        let surface = self.surface
+        pipeline.directTouchRegion = { [weak panel] in
+            guard let panel, panel.isVisible else { return nil }
+            return panel.cgFrame
+        }
+        // The key is driven straight from the touch point. Synthesizing a click instead
+        // would move the pointer onto the keyboard on every keystroke.
+        pipeline.pressKey = { [weak surface] contactID, point in
+            surface?.pressKey(contactID: contactID, atGlobalPoint: point) ?? false
+        }
+        pipeline.moveKey = { [weak surface] contactID, point in
+            surface?.moveKey(contactID: contactID, atGlobalPoint: point) ?? false
+        }
+        pipeline.releaseKey = { [weak surface] contactID in
+            surface?.releaseKey(contactID: contactID)
+        }
+        pipeline.isModifierKey = { [weak surface] point in
+            surface?.isModifierKey(atGlobalPoint: point) ?? false
+        }
     }
 
     /// True when the focused field actually lives on the touchscreen.
