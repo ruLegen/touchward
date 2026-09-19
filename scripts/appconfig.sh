@@ -8,8 +8,8 @@
 # the old identity do not carry over and Accessibility / Input Monitoring must be granted
 # again. Change them deliberately, not casually.
 
-APP_NAME="Touchward"
-BUNDLE_ID="com.ethannguyen.touchward"
+APP_NAME="Touchward SiS"
+BUNDLE_ID="com.rulegen.touchward.sis"
 VERSION="1.0.0"
 BUILD_NUMBER="1"
 
@@ -23,4 +23,4 @@ OUT_DIR="Artifacts"
 # requirement; with an ad-hoc signature that includes the binary hash, so every rebuild
 # looked like a brand new app and the grant was lost. A certificate keeps it constant.
 # Create it once with scripts/make-signing-cert.sh. Empty falls back to ad-hoc.
-SIGNING_IDENTITY="Touchward Local Signing"
+SIGNING_IDENTITY="Touchward SiS Local Signing"

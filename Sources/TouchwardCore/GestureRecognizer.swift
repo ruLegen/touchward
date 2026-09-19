@@ -6,6 +6,15 @@ public struct GestureConfig: Sendable {
     public var longPressDuration: TimeInterval = 0.60
     /// Movement in points beyond which a touch is a drag, not a tap.
     public var moveThreshold: CGFloat = 10
+    /// Two fingers must move this far together before scrolling begins.
+    public var twoFingerScrollThreshold: CGFloat = 10
+    /// A pinch needs a substantial, symmetric spread change while its centroid stays
+    /// nearly still. This deliberately biases ambiguous motion toward scrolling.
+    public var pinchDistanceThreshold: CGFloat = 8
+    public var pinchRatioThreshold: CGFloat = 0.08
+    public var pinchMaxCentroidDrift: CGFloat = 48
+    /// A gesture must dominate the competing interpretation by this factor.
+    public var intentDominanceRatio: CGFloat = 1.35
     /// Backstop for a drag whose report stream died (unplug, sleep, dropped final report).
     /// Deliberately generous: a change-driven controller sends nothing while a finger rests,
     /// so a short timeout would cut legitimate slow drags short.
@@ -14,7 +23,7 @@ public struct GestureConfig: Sendable {
     public init() {}
 }
 
-/// Trackpad-shaped state machine: one finger points and drags, two fingers scroll.
+/// Trackpad-shaped state machine: one finger points and drags; two fingers scroll or pinch.
 /// Feed it mapped frames in order; it returns the events that frame produced.
 ///
 /// Splitting one-finger drag from two-finger scroll avoids guessing intent from a single
@@ -29,20 +38,28 @@ public struct GestureConfig: Sendable {
 public struct GestureRecognizer: Sendable {
     public var config: GestureConfig
 
+    private enum MultiMode: Sendable {
+        case undecided
+        case scroll
+        case pinch
+    }
+
     /// Shared by `.twoDown` and `.settling` so a scroll that momentarily drops a contact
     /// can resume, and so a tap is still classified correctly when the fingers leave one
     /// at a time — which is what actually happens on real hardware.
     private struct TwoFinger {
         var startTime: TimeInterval
+        var startCentroid: CGPoint
         var lastCentroid: CGPoint
+        var startSpread: CGFloat
+        var lastSpread: CGFloat
         var moved: Bool
         /// True when these fingers arrived during an existing gesture (e.g. a drag). Such
         /// a sequence must never be reclassified as a two-finger tap.
         var wasGesture: Bool
         var contactCount: Int
-        /// Mean distance from the centroid, for the three-finger zoom. Held alongside the
-        /// centroid so a hand that changes finger count re-seeds both at once.
-        var lastSpread: CGFloat = 0
+        var contactIDs: [UInt8]
+        var mode: MultiMode
     }
 
     private enum State {
@@ -92,7 +109,7 @@ public struct GestureRecognizer: Sendable {
             if count >= 2 {
                 // More fingers reclassify the gesture; the pending tap is void.
                 state = count >= 3
-                    ? .threeDown(twoFinger(frame, wasGesture: true))
+                    ? .threeDown(twoFinger(frame, wasGesture: true, mode: .pinch))
                     : .twoDown(twoFinger(frame, wasGesture: false))
                 return []
             }
@@ -121,8 +138,8 @@ public struct GestureRecognizer: Sendable {
             }
             if count >= 2 {
                 state = count >= 3
-                    ? .threeDown(twoFinger(frame, wasGesture: true))
-                    : .twoDown(twoFinger(frame, wasGesture: true))
+                    ? .threeDown(twoFinger(frame, wasGesture: true, mode: .pinch))
+                    : .twoDown(twoFinger(frame, wasGesture: true, mode: .pinch))
                 return [.dragEnded(at: last)]
             }
             guard let point = point(of: id, in: frame) else {
@@ -151,29 +168,79 @@ public struct GestureRecognizer: Sendable {
                 return []
             }
             if count >= 3 {
-                // A third finger arrives: this is a zoom now, and it must not also emit the
-                // scroll implied by a centroid that just jumped onto a new contact set.
-                state = .threeDown(twoFinger(frame, wasGesture: true))
+                // A new contact changes the centroid and spread discontinuously.
+                // Three fingers continue as pinch, without a false scroll step.
+                state = .threeDown(twoFinger(frame, wasGesture: true, mode: .pinch))
                 return []
             }
-            guard count == two.contactCount else {
-                // A third finger landed (or one of three lifted). Diffing across a changed
-                // contact set would emit one large bogus scroll delta.
-                two.contactCount = count
-                two.lastCentroid = centroid(frame)
-                state = .twoDown(two)
+            guard contactIDs(frame) == two.contactIDs else {
+                state = .twoDown(reseeded(two, from: frame))
                 return []
             }
 
             let current = centroid(frame)
+            let currentSpread = spread(frame)
             let dx = current.x - two.lastCentroid.x
             let dy = current.y - two.lastCentroid.y
-            guard dx != 0 || dy != 0 else { return [] }
 
-            two.lastCentroid = current
-            two.moved = true
-            state = .twoDown(two)
-            return [.scroll(dx: dx, dy: dy, at: current)]
+            switch two.mode {
+            case .undecided:
+                let translation = distance(current, two.startCentroid)
+                let spreadChange = abs(currentSpread - two.startSpread)
+                let spreadRatio = two.startSpread > 0
+                    ? spreadChange / two.startSpread : 0
+                // Apple-like intent resolution: compare normalized evidence for the
+                // two interpretations instead of letting one absolute threshold win.
+                // A dead zone plus dominance hysteresis prevents a slightly skewed scroll
+                // from becoming zoom while still allowing a pinch whose centroid drifts.
+                let scrollScore = translation / max(config.twoFingerScrollThreshold, 1)
+                let pinchScore = max(
+                    spreadChange / max(config.pinchDistanceThreshold, 1),
+                    spreadRatio / max(config.pinchRatioThreshold, 0.001)
+                )
+                let dominance = max(config.intentDominanceRatio, 1)
+                if pinchScore >= 1,
+                   pinchScore >= scrollScore * dominance,
+                   translation <= config.pinchMaxCentroidDrift,
+                   currentSpread > 0, two.startSpread > 0 {
+                    two.mode = .pinch
+                    two.moved = true
+                    two.lastCentroid = current
+                    two.lastSpread = currentSpread
+                    state = .twoDown(two)
+                    return [.pinch(scale: currentSpread / two.startSpread, at: current)]
+                }
+                if scrollScore >= 1,
+                   scrollScore >= pinchScore * dominance {
+                    two.mode = .scroll
+                    two.moved = true
+                    two.lastCentroid = current
+                    two.lastSpread = currentSpread
+                    state = .twoDown(two)
+                    return [.scroll(dx: current.x - two.startCentroid.x,
+                                    dy: current.y - two.startCentroid.y, at: current)]
+                }
+                return []
+
+            case .scroll:
+                guard dx != 0 || dy != 0 else { return [] }
+                two.lastCentroid = current
+                two.lastSpread = currentSpread
+                state = .twoDown(two)
+                return [.scroll(dx: dx, dy: dy, at: current)]
+
+            case .pinch:
+                guard two.lastSpread > 0, currentSpread > 0 else {
+                    two.lastSpread = currentSpread
+                    state = .twoDown(two)
+                    return []
+                }
+                let scale = currentSpread / two.lastSpread
+                two.lastCentroid = current
+                two.lastSpread = currentSpread
+                state = .twoDown(two)
+                return scale == 1 ? [] : [.pinch(scale: scale, at: current)]
+            }
 
         case .threeDown(var three):
             if count == 0 {
@@ -186,10 +253,10 @@ public struct GestureRecognizer: Sendable {
                 state = .settling(three)
                 return []
             }
-            guard count == three.contactCount else {
-                // The finger count changed: a spread measured across a different set of
-                // contacts would be a step the hand never made.
-                state = .threeDown(reseeded(three, from: frame))
+            guard count == three.contactCount,
+                  contactIDs(frame) == three.contactIDs else {
+                // A changed contact set cannot be compared with the old spread.
+                state = .threeDown(reseeded(three, from: frame, mode: .pinch))
                 return []
             }
 
@@ -217,14 +284,13 @@ public struct GestureRecognizer: Sendable {
                 return finishTwoFinger(two, at: frame.time)
             }
             if count >= 3 {
-                state = .threeDown(reseeded(two, from: frame))
+                state = .threeDown(reseeded(two, from: frame, mode: .pinch))
                 return []
             }
             if count >= 2 {
                 // The dropped contact came back — resume scrolling from a fresh centroid
                 // rather than stranding the gesture until the whole hand lifts.
-                two.contactCount = count
-                two.lastCentroid = centroid(frame)
+                two = reseeded(two, from: frame)
                 state = .twoDown(two)
                 return []
             }
@@ -248,8 +314,11 @@ public struct GestureRecognizer: Sendable {
             // resting, and sessionEnded would warp the cursor off the touchscreen while
             // the user is still touching it. A real zero-contact frame, or forceRelease,
             // ends the session.
-            state = .settling(TwoFinger(startTime: lastFrameTime, lastCentroid: last,
-                                        moved: true, wasGesture: true, contactCount: 1))
+            state = .settling(TwoFinger(startTime: lastFrameTime,
+                                        startCentroid: last, lastCentroid: last,
+                                        startSpread: 0, lastSpread: 0,
+                                        moved: true, wasGesture: true, contactCount: 1,
+                                        contactIDs: [], mode: .undecided))
             return [.dragEnded(at: last)]
 
         default:
@@ -286,7 +355,7 @@ public struct GestureRecognizer: Sendable {
         default:
             // A whole hand landing at once is a zoom from its very first frame, and never
             // a two-finger tap on the way out.
-            state = .threeDown(twoFinger(frame, wasGesture: true))
+            state = .threeDown(twoFinger(frame, wasGesture: true, mode: .pinch))
         }
         return []
     }
@@ -299,22 +368,37 @@ public struct GestureRecognizer: Sendable {
         state = .oneDown(id: contact.id, start: contact.point, startTime: frame.time)
     }
 
-    private func twoFinger(_ frame: MappedFrame, wasGesture: Bool) -> TwoFinger {
-        TwoFinger(startTime: frame.time, lastCentroid: centroid(frame),
-                  moved: false, wasGesture: wasGesture, contactCount: frame.contacts.count,
-                  lastSpread: spread(frame))
+    private func twoFinger(_ frame: MappedFrame, wasGesture: Bool,
+                           mode: MultiMode = .undecided) -> TwoFinger {
+        let centre = centroid(frame)
+        let width = spread(frame)
+        return TwoFinger(startTime: frame.time, startCentroid: centre,
+                         lastCentroid: centre, startSpread: width, lastSpread: width,
+                         moved: false, wasGesture: wasGesture, contactCount: frame.contacts.count,
+                         contactIDs: contactIDs(frame), mode: mode)
     }
 
     /// Re-anchors an in-flight multi-finger gesture on the contacts present now, keeping
     /// how it started. Used whenever the contact set changes, so the next frame is measured
     /// against something real instead of reporting the change itself as a movement.
-    private func reseeded(_ existing: TwoFinger, from frame: MappedFrame) -> TwoFinger {
+    private func reseeded(_ existing: TwoFinger, from frame: MappedFrame,
+                          mode: MultiMode? = nil) -> TwoFinger {
         var updated = existing
+        let centre = centroid(frame)
+        let width = spread(frame)
         updated.contactCount = frame.contacts.count
-        updated.lastCentroid = centroid(frame)
-        updated.lastSpread = spread(frame)
+        updated.contactIDs = contactIDs(frame)
+        updated.startCentroid = centre
+        updated.lastCentroid = centre
+        updated.startSpread = width
+        updated.lastSpread = width
         updated.wasGesture = true
+        if let mode { updated.mode = mode }
         return updated
+    }
+
+    private func contactIDs(_ frame: MappedFrame) -> [UInt8] {
+        frame.contacts.map(\.id).sorted()
     }
 
     /// Mean distance from the centroid: how open the hand is, in points. Comparing this

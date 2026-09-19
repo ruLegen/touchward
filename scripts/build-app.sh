@@ -35,6 +35,9 @@ mkdir -p "${CONTENTS}/MacOS" "${CONTENTS}/Resources"
 
 cp "$BIN" "${CONTENTS}/MacOS/${APP_NAME}"
 cp Resources/AppIcon.icns "${CONTENTS}/Resources/AppIcon.icns"
+if [ -f Resources/KeyboardKey.caf ]; then
+  cp Resources/KeyboardKey.caf "${CONTENTS}/Resources/KeyboardKey.caf"
+fi
 
 # Info.plist is generated, not stored, so the display name and identifier can never fall
 # out of step with appconfig.sh.

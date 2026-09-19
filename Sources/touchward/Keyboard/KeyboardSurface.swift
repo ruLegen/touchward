@@ -11,6 +11,7 @@ final class KeyboardSurface: NSView {
     let tab: MinimizedTab
 
     private(set) var isMinimized = false
+    private var tabContacts = Set<UInt8>()
 
     /// Asked for by a key press or a tap on the tab. The panel does the resizing.
     var onMinimizeRequest: (() -> Void)?
@@ -44,26 +45,54 @@ final class KeyboardSurface: NSView {
         isMinimized = minimized
         keyboard.isHidden = minimized
         tab.isHidden = !minimized
-        keyboard.releaseKey()
+        keyboard.releaseAllKeys()
+        tabContacts.removeAll()
+        tab.release()
         needsLayout = true
     }
 
     // MARK: touch entry points
 
     @discardableResult
-    func pressKey(atGlobalPoint point: CGPoint) -> Bool {
-        isMinimized ? tab.press(atGlobalPoint: point) : keyboard.pressKey(atGlobalPoint: point)
+    func pressKey(contactID: UInt8, atGlobalPoint point: CGPoint) -> Bool {
+        if isMinimized {
+            guard tabContacts.insert(contactID).inserted else { return true }
+            return tab.press(atGlobalPoint: point)
+        }
+        return keyboard.pressKey(contactID: contactID, atGlobalPoint: point)
     }
 
-    func releaseKey() {
-        keyboard.releaseKey()
+    @discardableResult
+    func moveKey(contactID: UInt8, atGlobalPoint point: CGPoint) -> Bool {
+        if isMinimized { return true }
+        return keyboard.moveKey(contactID: contactID, atGlobalPoint: point)
+    }
+
+    func releaseKey(contactID: UInt8) {
+        if isMinimized {
+            tabContacts.remove(contactID)
+            if tabContacts.isEmpty { tab.release() }
+        } else {
+            keyboard.releaseKey(contactID: contactID)
+        }
+    }
+
+    func releaseAllKeys() {
+        keyboard.releaseAllKeys()
+        tabContacts.removeAll()
         tab.release()
+    }
+
+    func isModifierKey(atGlobalPoint point: CGPoint) -> Bool {
+        guard !isMinimized else { return false }
+        return keyboard.isModifierKey(atGlobalPoint: point)
     }
 
     func setSecureInputWarning(_ visible: Bool) {
         keyboard.setSecureInputWarning(visible)
     }
 }
+
 
 /// What the keyboard shrinks to: one large, labelled target that brings it back. Deliberately
 /// not an icon on its own — a bare glyph on a strange panel is a guessing game.

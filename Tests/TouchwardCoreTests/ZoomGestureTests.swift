@@ -2,8 +2,7 @@ import CoreGraphics
 import XCTest
 @testable import TouchwardCore
 
-/// Three fingers zoom. Two fingers already scroll, so spreading and pinching a third finger
-/// in is the gesture left that nothing else claims.
+/// Two fingers choose between scroll and pinch. Three fingers keep the existing pinch.
 ///
 /// The recognizer reports a *ratio*, not a distance: how much the hand opened since the last
 /// frame. The synthesizer decides what a ratio means on this platform, exactly as it already
@@ -142,5 +141,30 @@ final class ZoomGestureTests: XCTestCase {
 
         let out = scales(r.handle(hand(spread: 100, at: 0.05)))
         XCTAssertTrue(out.allSatisfy { $0.isFinite }, "never divide by a zero spread")
+    }
+
+    func testTwoFingerSpreadPinchesWithoutScrolling() {
+        var r = GestureRecognizer()
+        _ = r.handle(frame([(1, 100, 100), (2, 200, 100)], at: 0))
+        let events = r.handle(frame([(1, 90, 100), (2, 210, 100)], at: 0.05))
+        XCTAssertEqual(events, [.pinch(scale: 1.2, at: CGPoint(x: 150, y: 100))])
+    }
+
+    func testTwoFingerPinchStaysPinchWhenHandSlides() {
+        var r = GestureRecognizer()
+        _ = r.handle(frame([(1, 100, 100), (2, 200, 100)], at: 0))
+        _ = r.handle(frame([(1, 90, 100), (2, 210, 100)], at: 0.05))
+        XCTAssertEqual(r.handle(frame([(1, 120, 100), (2, 240, 100)], at: 0.10)), [],
+                       "translation during a pinch must not scroll")
+        XCTAssertEqual(r.handle(empty(at: 0.15)), [.sessionEnded])
+    }
+
+    func testTwoFingerScrollStaysScrollWhenSpreadChanges() {
+        var r = GestureRecognizer()
+        _ = r.handle(frame([(1, 100, 100), (2, 200, 100)], at: 0))
+        XCTAssertEqual(r.handle(frame([(1, 120, 100), (2, 220, 100)], at: 0.05)),
+                       [.scroll(dx: 20, dy: 0, at: CGPoint(x: 170, y: 100))])
+        XCTAssertEqual(r.handle(frame([(1, 100, 100), (2, 240, 100)], at: 0.10)), [],
+                       "spreading during a scroll must not switch to pinch")
     }
 }

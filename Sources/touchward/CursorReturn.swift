@@ -13,6 +13,7 @@ final class CursorReturn {
     /// Real mouse activity newer than this cancels a pending return.
     var mouseGrace: TimeInterval = 1.0
 
+    var onRealMouseActivity: (() -> Void)?
     private var lastRealMouseActivity: TimeInterval = 0
     private var pendingWorkItem: DispatchWorkItem?
     private var tap: CFMachPort?
@@ -81,6 +82,7 @@ final class CursorReturn {
 
     fileprivate func noteRealMouseActivity() {
         lastRealMouseActivity = Date().timeIntervalSinceReferenceDate
+        onRealMouseActivity?()
         // The user took over — abandon any return we had queued.
         pendingWorkItem?.cancel()
         pendingWorkItem = nil

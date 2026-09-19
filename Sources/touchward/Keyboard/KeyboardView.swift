@@ -1,6 +1,28 @@
 import AppKit
 import Carbon.HIToolbox
 
+enum ModifierKind: Hashable {
+    case control
+    case option
+    case command
+
+    var keyCode: CGKeyCode {
+        switch self {
+        case .control: return CGKeyCode(kVK_Control)
+        case .option: return CGKeyCode(kVK_Option)
+        case .command: return CGKeyCode(kVK_Command)
+        }
+    }
+
+    var eventFlag: CGEventFlags {
+        switch self {
+        case .control: return .maskControl
+        case .option: return .maskAlternate
+        case .command: return .maskCommand
+        }
+    }
+}
+
 /// The on-screen keys, laid out the way iPadOS lays them out.
 ///
 /// Matching a keyboard people already know is the whole point: the letters plane keeps
@@ -24,6 +46,7 @@ final class KeyboardView: NSView {
     enum Action {
         case character(plain: String, shifted: String)
         case shift
+        case modifier(ModifierKind)
         case delete
         case newline
         case tab
@@ -60,6 +83,7 @@ final class KeyboardView: NSView {
     }
 
     private let injector: KeyInjector
+    private let soundPlayer = KeyboardSoundPlayer()
     private var plane: Plane = .letters
     private var shift: ShiftState = .off
     private var lastShiftTap: TimeInterval = 0
@@ -116,9 +140,9 @@ final class KeyboardView: NSView {
             return [
                 ["q", "w", "e", "r", "t", "y", "u", "i", "o", "p"].map { Key.char($0) }
                     + [Key(.delete, width: 1.5, label: "⌫")],
-                [Key(.spacer, width: 0.5)]
+                [Key(.tab, width: 0.8, label: "⇥")]
                     + ["a", "s", "d", "f", "g", "h", "j", "k", "l"].map { Key.char($0) }
-                    + [Key(.newline, width: 2, label: "return")],
+                    + [Key(.newline, width: 1.7, label: "return")],
                 [Key(.shift, width: 1.25, label: "⇧")]
                     + ["z", "x", "c", "v", "b", "n", "m"].map { Key.char($0) }
                     + [Key.char(",", ";"), Key.char(".", ":")]
@@ -129,9 +153,9 @@ final class KeyboardView: NSView {
             return [
                 ["1", "2", "3", "4", "5", "6", "7", "8", "9", "0"].map { Key.char($0, $0) }
                     + [Key(.delete, width: 1.5, label: "⌫")],
-                [Key(.spacer, width: 0.5)]
+                [Key(.tab, width: 0.8, label: "⇥")]
                     + ["-", "/", ":", ";", "(", ")", "$", "&", "@"].map { Key.char($0, $0) }
-                    + [Key(.newline, width: 2, label: "return")],
+                    + [Key(.newline, width: 1.7, label: "return")],
                 [Key(.plane(.symbols), width: 1.25, label: "#+=")]
                     + ["\"", ".", ",", "?", "!", "'", "%"].map { Key.char($0, $0) }
                     + [Key.char("*", "*"), Key.char("#", "#")]
@@ -142,9 +166,9 @@ final class KeyboardView: NSView {
             return [
                 ["[", "]", "{", "}", "#", "%", "^", "*", "+", "="].map { Key.char($0, $0) }
                     + [Key(.delete, width: 1.5, label: "⌫")],
-                [Key(.spacer, width: 0.5)]
+                [Key(.tab, width: 0.8, label: "⇥")]
                     + ["_", "\\", "|", "~", "<", ">", "€", "£", "¥"].map { Key.char($0, $0) }
-                    + [Key(.newline, width: 2, label: "return")],
+                    + [Key(.newline, width: 1.7, label: "return")],
                 [Key(.plane(.numbers), width: 1.25, label: "123")]
                     + [".", ",", "?", "!", "'", "\"", "•"].map { Key.char($0, $0) }
                     + [Key.char("§", "§"), Key.char("¶", "¶")]
@@ -156,14 +180,18 @@ final class KeyboardView: NSView {
 
     private var bottomRow: [Key] {
         let toggle: Key = plane == .letters
-            ? Key(.plane(.numbers), width: 1.5, label: ".?123")
-            : Key(.plane(.letters), width: 1.5, label: "ABC")
+            ? Key(.plane(.numbers), width: 1.1, label: ".?123")
+            : Key(.plane(.letters), width: 1.1, label: "ABC")
         return [
             toggle,
-            Key(.tab, width: 1, label: "⇥"),
-            Key(.character(plain: " ", shifted: " "), width: 5.5, label: "space"),
-            toggle,
-            Key(.hide, width: 1.5, label: "⌨︎↓"),
+            Key(.modifier(.control), width: 0.85, label: "ctrl"),
+            Key(.modifier(.option), width: 0.85, label: "alt"),
+            Key(.modifier(.command), width: 0.85, label: "⌘"),
+            Key(.character(plain: " ", shifted: " "), width: 4.7, label: "space"),
+            Key(.modifier(.command), width: 0.85, label: "⌘"),
+            Key(.modifier(.option), width: 0.85, label: "alt"),
+            Key(.modifier(.control), width: 0.85, label: "ctrl"),
+            Key(.hide, width: 0.6, label: "⌨︎↓"),
         ]
     }
 
@@ -216,8 +244,12 @@ final class KeyboardView: NSView {
 
     // MARK: input
 
-    /// The key a finger is resting on, so the release knows what to un-press.
-    private weak var touchedKey: KeyButton?
+    /// Each HID contact owns one key independently. This is what allows Shift+letter
+    /// and two simultaneous letters without one finger releasing the other.
+    private var touchedKeys: [UInt8: KeyButton] = [:]
+    private var heldShiftContacts = Set<UInt8>()
+    private var heldModifierContacts: [ModifierKind: Set<UInt8>] = [:]
+    private var shiftWasUsedWhileHeld = false
 
     /// Presses whatever key sits under a point in the global, top-left-origin space that
     /// CGEvent and the touch mapper use. Returns true when a key was hit.
@@ -226,22 +258,63 @@ final class KeyboardView: NSView {
     /// no longer drags the pointer onto the touchscreen: a synthetic `leftMouseDown` *is* a
     /// cursor move.
     @discardableResult
-    func pressKey(atGlobalPoint point: CGPoint) -> Bool {
-        releaseKey()
+    func pressKey(contactID: UInt8, atGlobalPoint point: CGPoint) -> Bool {
         guard let button = key(atGlobalPoint: point), button.isEnabled else { return false }
 
-        touchedKey = button
-        button.isPressed = true
-        // Fire on touch-down. On glass there is no way to slide off a key to cancel, and
-        // waiting for the lift makes every keystroke feel late.
-        perform(button.key)
+        if let current = touchedKeys[contactID] {
+            if current === button { return true }
+            releaseKey(contactID: contactID)
+        }
+
+        touchedKeys[contactID] = button
+        button.press(for: contactID)
+        perform(button.key, contactID: contactID)
+        soundPlayer.play()
         return true
     }
 
-    /// The finger left the glass. Only clears the highlight — the key fired on the way down.
-    func releaseKey() {
-        touchedKey?.isPressed = false
-        touchedKey = nil
+    @discardableResult
+    func moveKey(contactID: UInt8, atGlobalPoint point: CGPoint) -> Bool {
+        guard let button = key(atGlobalPoint: point), button.isEnabled else {
+            releaseKey(contactID: contactID)
+            return false
+        }
+        if touchedKeys[contactID] === button { return true }
+        releaseKey(contactID: contactID)
+        return pressKey(contactID: contactID, atGlobalPoint: point)
+    }
+
+    func releaseKey(contactID: UInt8) {
+        guard let button = touchedKeys.removeValue(forKey: contactID) else { return }
+        button.release(for: contactID)
+        switch button.key.action {
+        case .delete:
+            injector.releaseKey(CGKeyCode(kVK_Delete))
+        case .shift:
+            releaseShift(contactID: contactID)
+        case .modifier(let modifier):
+            releaseModifier(modifier, contactID: contactID)
+        default:
+            break
+        }
+    }
+
+    func releaseAllKeys() {
+        let ids = Array(touchedKeys.keys)
+        for id in ids { releaseKey(contactID: id) }
+        touchedKeys.removeAll()
+        heldShiftContacts.removeAll()
+        heldModifierContacts.removeAll()
+        shiftWasUsedWhileHeld = false
+        injector.releaseAllKeys()
+    }
+
+    func isModifierKey(atGlobalPoint point: CGPoint) -> Bool {
+        guard let button = key(atGlobalPoint: point) else { return false }
+        switch button.key.action {
+        case .shift, .modifier: return true
+        default: return false
+        }
     }
 
     private func key(atGlobalPoint point: CGPoint) -> KeyButton? {
@@ -257,30 +330,64 @@ final class KeyboardView: NSView {
 
     @objc private func keyTapped(_ sender: KeyButton) {
         perform(sender.key)
+        soundPlayer.play()
     }
 
-    private func perform(_ key: Key) {
+    private func perform(_ key: Key, contactID: UInt8? = nil) {
         switch key.action {
         case .character(let plain, let shifted):
+            let heldShift = !heldShiftContacts.isEmpty
             injector.type(shift.isUp ? shifted : plain)
-            if shift == .oneShot {
+            if heldShift && shift == .oneShot {
+                shiftWasUsedWhileHeld = true
+            } else if !heldShift && shift == .oneShot {
                 shift = .off
                 refreshTitles()
             }
 
         case .shift:
-            let now = Date().timeIntervalSinceReferenceDate
-            // A second tap inside the double-tap window locks it, as on iPadOS.
-            if shift.isUp, now - lastShiftTap < 0.4 {
-                shift = .locked
-            } else {
-                shift = shift.isUp ? .off : .oneShot
+            guard let contactID else {
+                let now = Date().timeIntervalSinceReferenceDate
+                // A second tap inside the double-tap window locks it, as on iPadOS.
+                if shift.isUp, now - lastShiftTap < 0.4 {
+                    shift = .locked
+                } else {
+                    shift = shift.isUp ? .off : .oneShot
+                }
+                lastShiftTap = now
+                refreshTitles()
+                return
             }
-            lastShiftTap = now
+
+            let now = Date().timeIntervalSinceReferenceDate
+            let wasAlreadyHeld = !heldShiftContacts.isEmpty
+            if !wasAlreadyHeld {
+                if shift.isUp, now - lastShiftTap < 0.4 {
+                    shift = .locked
+                } else {
+                    shift = shift.isUp ? .off : .oneShot
+                }
+                lastShiftTap = now
+                shiftWasUsedWhileHeld = false
+            }
+            heldShiftContacts.insert(contactID)
             refreshTitles()
 
+        case .modifier(let modifier):
+            if let contactID {
+                heldModifierContacts[modifier, default: []].insert(contactID)
+                injector.pressModifier(modifier)
+            } else {
+                injector.pressModifier(modifier)
+                injector.releaseModifier(modifier)
+            }
+
         case .delete:
-            injector.sendKey(CGKeyCode(kVK_Delete))
+            if contactID != nil {
+                injector.pressKey(CGKeyCode(kVK_Delete), repeatable: true)
+            } else {
+                injector.sendKey(CGKeyCode(kVK_Delete))
+            }
 
         case .newline:
             injector.sendKey(CGKeyCode(kVK_Return))
@@ -301,6 +408,26 @@ final class KeyboardView: NSView {
         }
     }
 
+    private func releaseShift(contactID: UInt8) {
+        heldShiftContacts.remove(contactID)
+        guard heldShiftContacts.isEmpty,
+              shift == .oneShot,
+              shiftWasUsedWhileHeld else { return }
+        shift = .off
+        shiftWasUsedWhileHeld = false
+        refreshTitles()
+    }
+
+    private func releaseModifier(_ modifier: ModifierKind, contactID: UInt8) {
+        guard var contacts = heldModifierContacts[modifier], contacts.remove(contactID) != nil else { return }
+        injector.releaseModifier(modifier)
+        if contacts.isEmpty {
+            heldModifierContacts.removeValue(forKey: modifier)
+        } else {
+            heldModifierContacts[modifier] = contacts
+        }
+    }
+
     private func refreshTitles() {
         for button in buttons {
             button.render(shifted: shift.isUp, shiftState: shift)
@@ -316,12 +443,24 @@ final class KeyButton: NSButton {
     var isPressed = false {
         didSet { needsDisplay = true; updateColors() }
     }
+    private var pressedContacts = Set<UInt8>()
+
+    func press(for contactID: UInt8) {
+        pressedContacts.insert(contactID)
+        isPressed = true
+    }
+
+    func release(for contactID: UInt8) {
+        pressedContacts.remove(contactID)
+        isPressed = !pressedContacts.isEmpty
+    }
 
     init(key: KeyboardView.Key, target: AnyObject, action: Selector) {
         self.key = key
         super.init(frame: .zero)
         self.target = target
         self.action = action
+        toolTip = Self.tooltip(for: key.action)
 
         isBordered = false
         bezelStyle = .regularSquare
@@ -333,6 +472,15 @@ final class KeyButton: NSButton {
     }
 
     required init?(coder: NSCoder) { fatalError("not used") }
+
+    private static func tooltip(for action: KeyboardView.Action) -> String? {
+        switch action {
+        case .modifier(.control): return "Control"
+        case .modifier(.option): return "Option (Alt)"
+        case .modifier(.command): return "Command"
+        default: return nil
+        }
+    }
 
     /// Every click into this keyboard is a first-mouse click — the app is an accessory and
     /// the panel refuses key status. `NSButton` declines those by default, which would make
