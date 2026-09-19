@@ -12,6 +12,7 @@ import Foundation
 final class KeyInjector {
     private let source: CGEventSource?
     private var heldKeyCounts: [CGKeyCode: Int] = [:]
+    private var heldModifierCounts: [ModifierKind: Int] = [:]
     private var repeatKey: CGKeyCode?
     private var repeatFlags: CGEventFlags = []
     private var repeatDelayTimer: Timer?
@@ -38,7 +39,7 @@ final class KeyInjector {
     }
 
     func sendKey(_ keyCode: CGKeyCode, flags: CGEventFlags = []) {
-        postKeyDown(keyCode, flags: flags)
+        postKeyDown(keyCode, flags: flags.union(activeModifierFlags))
         postKeyUp(keyCode)
     }
 
@@ -49,7 +50,7 @@ final class KeyInjector {
         heldKeyCounts[keyCode] = count + 1
         guard count == 0 else { return }
 
-        postKeyDown(keyCode, flags: flags)
+        postKeyDown(keyCode, flags: flags.union(activeModifierFlags))
         if repeatable {
             repeatKey = keyCode
             repeatFlags = flags
@@ -68,11 +69,42 @@ final class KeyInjector {
         if repeatKey == keyCode { stopRepeat() }
     }
 
+    /// Presses a physical modifier. Counts are per modifier so two contacts can hold
+    /// the same key without the first contact's release sending keyUp too early.
+    func pressModifier(_ modifier: ModifierKind) {
+        let count = heldModifierCounts[modifier, default: 0]
+        heldModifierCounts[modifier] = count + 1
+        guard count == 0 else { return }
+        postKeyDown(modifier.keyCode, flags: activeModifierFlags)
+    }
+
+    func releaseModifier(_ modifier: ModifierKind) {
+        guard let count = heldModifierCounts[modifier] else { return }
+        if count > 1 {
+            heldModifierCounts[modifier] = count - 1
+            return
+        }
+        heldModifierCounts.removeValue(forKey: modifier)
+        postKeyUp(modifier.keyCode)
+    }
+
     func releaseAllKeys() {
         let keys = Array(heldKeyCounts.keys)
         heldKeyCounts.removeAll()
         stopRepeat()
         for key in keys { postKeyUp(key) }
+
+        let modifiers = Array(heldModifierCounts.keys)
+        for modifier in modifiers {
+            heldModifierCounts.removeValue(forKey: modifier)
+            postKeyUp(modifier.keyCode)
+        }
+    }
+
+    private var activeModifierFlags: CGEventFlags {
+        heldModifierCounts.reduce(into: CGEventFlags()) { flags, item in
+            if item.value > 0 { flags.formUnion(item.key.eventFlag) }
+        }
     }
 
     private func postKeyDown(_ keyCode: CGKeyCode, flags: CGEventFlags = []) {
@@ -102,7 +134,7 @@ final class KeyInjector {
         guard repeatKey != nil else { return }
         let timer = Timer(timeInterval: 0.055, repeats: true) { [weak self] _ in
             guard let self, let repeatKey = self.repeatKey else { return }
-            self.postKeyDown(repeatKey, flags: self.repeatFlags)
+            self.postKeyDown(repeatKey, flags: self.repeatFlags.union(self.activeModifierFlags))
         }
         repeatTimer = timer
         RunLoop.main.add(timer, forMode: .common)
@@ -125,6 +157,8 @@ final class KeyInjector {
 
         guard !utf16.isEmpty else { return }
 
+        down.flags = activeModifierFlags
+        up.flags = activeModifierFlags
         down.keyboardSetUnicodeString(stringLength: utf16.count, unicodeString: &utf16)
         down.post(tap: .cghidEventTap)
 

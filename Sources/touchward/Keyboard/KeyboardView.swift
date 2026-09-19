@@ -1,6 +1,28 @@
 import AppKit
 import Carbon.HIToolbox
 
+enum ModifierKind: Hashable {
+    case control
+    case option
+    case command
+
+    var keyCode: CGKeyCode {
+        switch self {
+        case .control: return CGKeyCode(kVK_Control)
+        case .option: return CGKeyCode(kVK_Option)
+        case .command: return CGKeyCode(kVK_Command)
+        }
+    }
+
+    var eventFlag: CGEventFlags {
+        switch self {
+        case .control: return .maskControl
+        case .option: return .maskAlternate
+        case .command: return .maskCommand
+        }
+    }
+}
+
 /// The on-screen keys, laid out the way iPadOS lays them out.
 ///
 /// Matching a keyboard people already know is the whole point: the letters plane keeps
@@ -24,6 +46,7 @@ final class KeyboardView: NSView {
     enum Action {
         case character(plain: String, shifted: String)
         case shift
+        case modifier(ModifierKind)
         case delete
         case newline
         case tab
@@ -117,9 +140,9 @@ final class KeyboardView: NSView {
             return [
                 ["q", "w", "e", "r", "t", "y", "u", "i", "o", "p"].map { Key.char($0) }
                     + [Key(.delete, width: 1.5, label: "⌫")],
-                [Key(.spacer, width: 0.5)]
+                [Key(.tab, width: 0.8, label: "⇥")]
                     + ["a", "s", "d", "f", "g", "h", "j", "k", "l"].map { Key.char($0) }
-                    + [Key(.newline, width: 2, label: "return")],
+                    + [Key(.newline, width: 1.7, label: "return")],
                 [Key(.shift, width: 1.25, label: "⇧")]
                     + ["z", "x", "c", "v", "b", "n", "m"].map { Key.char($0) }
                     + [Key.char(",", ";"), Key.char(".", ":")]
@@ -130,9 +153,9 @@ final class KeyboardView: NSView {
             return [
                 ["1", "2", "3", "4", "5", "6", "7", "8", "9", "0"].map { Key.char($0, $0) }
                     + [Key(.delete, width: 1.5, label: "⌫")],
-                [Key(.spacer, width: 0.5)]
+                [Key(.tab, width: 0.8, label: "⇥")]
                     + ["-", "/", ":", ";", "(", ")", "$", "&", "@"].map { Key.char($0, $0) }
-                    + [Key(.newline, width: 2, label: "return")],
+                    + [Key(.newline, width: 1.7, label: "return")],
                 [Key(.plane(.symbols), width: 1.25, label: "#+=")]
                     + ["\"", ".", ",", "?", "!", "'", "%"].map { Key.char($0, $0) }
                     + [Key.char("*", "*"), Key.char("#", "#")]
@@ -143,9 +166,9 @@ final class KeyboardView: NSView {
             return [
                 ["[", "]", "{", "}", "#", "%", "^", "*", "+", "="].map { Key.char($0, $0) }
                     + [Key(.delete, width: 1.5, label: "⌫")],
-                [Key(.spacer, width: 0.5)]
+                [Key(.tab, width: 0.8, label: "⇥")]
                     + ["_", "\\", "|", "~", "<", ">", "€", "£", "¥"].map { Key.char($0, $0) }
-                    + [Key(.newline, width: 2, label: "return")],
+                    + [Key(.newline, width: 1.7, label: "return")],
                 [Key(.plane(.numbers), width: 1.25, label: "123")]
                     + [".", ",", "?", "!", "'", "\"", "•"].map { Key.char($0, $0) }
                     + [Key.char("§", "§"), Key.char("¶", "¶")]
@@ -157,14 +180,18 @@ final class KeyboardView: NSView {
 
     private var bottomRow: [Key] {
         let toggle: Key = plane == .letters
-            ? Key(.plane(.numbers), width: 1.5, label: ".?123")
-            : Key(.plane(.letters), width: 1.5, label: "ABC")
+            ? Key(.plane(.numbers), width: 1.1, label: ".?123")
+            : Key(.plane(.letters), width: 1.1, label: "ABC")
         return [
             toggle,
-            Key(.tab, width: 1, label: "⇥"),
-            Key(.character(plain: " ", shifted: " "), width: 5.5, label: "space"),
-            toggle,
-            Key(.hide, width: 1.5, label: "⌨︎↓"),
+            Key(.modifier(.control), width: 0.85, label: "ctrl"),
+            Key(.modifier(.option), width: 0.85, label: "alt"),
+            Key(.modifier(.command), width: 0.85, label: "⌘"),
+            Key(.character(plain: " ", shifted: " "), width: 4.7, label: "space"),
+            Key(.modifier(.command), width: 0.85, label: "⌘"),
+            Key(.modifier(.option), width: 0.85, label: "alt"),
+            Key(.modifier(.control), width: 0.85, label: "ctrl"),
+            Key(.hide, width: 0.6, label: "⌨︎↓"),
         ]
     }
 
@@ -221,6 +248,7 @@ final class KeyboardView: NSView {
     /// and two simultaneous letters without one finger releasing the other.
     private var touchedKeys: [UInt8: KeyButton] = [:]
     private var heldShiftContacts = Set<UInt8>()
+    private var heldModifierContacts: [ModifierKind: Set<UInt8>] = [:]
     private var shiftWasUsedWhileHeld = false
 
     /// Presses whatever key sits under a point in the global, top-left-origin space that
@@ -264,6 +292,8 @@ final class KeyboardView: NSView {
             injector.releaseKey(CGKeyCode(kVK_Delete))
         case .shift:
             releaseShift(contactID: contactID)
+        case .modifier(let modifier):
+            releaseModifier(modifier, contactID: contactID)
         default:
             break
         }
@@ -274,14 +304,17 @@ final class KeyboardView: NSView {
         for id in ids { releaseKey(contactID: id) }
         touchedKeys.removeAll()
         heldShiftContacts.removeAll()
+        heldModifierContacts.removeAll()
         shiftWasUsedWhileHeld = false
         injector.releaseAllKeys()
     }
 
     func isModifierKey(atGlobalPoint point: CGPoint) -> Bool {
         guard let button = key(atGlobalPoint: point) else { return false }
-        if case .shift = button.key.action { return true }
-        return false
+        switch button.key.action {
+        case .shift, .modifier: return true
+        default: return false
+        }
     }
 
     private func key(atGlobalPoint point: CGPoint) -> KeyButton? {
@@ -340,6 +373,15 @@ final class KeyboardView: NSView {
             heldShiftContacts.insert(contactID)
             refreshTitles()
 
+        case .modifier(let modifier):
+            if let contactID {
+                heldModifierContacts[modifier, default: []].insert(contactID)
+                injector.pressModifier(modifier)
+            } else {
+                injector.pressModifier(modifier)
+                injector.releaseModifier(modifier)
+            }
+
         case .delete:
             if contactID != nil {
                 injector.pressKey(CGKeyCode(kVK_Delete), repeatable: true)
@@ -376,6 +418,16 @@ final class KeyboardView: NSView {
         refreshTitles()
     }
 
+    private func releaseModifier(_ modifier: ModifierKind, contactID: UInt8) {
+        guard var contacts = heldModifierContacts[modifier], contacts.remove(contactID) != nil else { return }
+        injector.releaseModifier(modifier)
+        if contacts.isEmpty {
+            heldModifierContacts.removeValue(forKey: modifier)
+        } else {
+            heldModifierContacts[modifier] = contacts
+        }
+    }
+
     private func refreshTitles() {
         for button in buttons {
             button.render(shifted: shift.isUp, shiftState: shift)
@@ -408,6 +460,7 @@ final class KeyButton: NSButton {
         super.init(frame: .zero)
         self.target = target
         self.action = action
+        toolTip = Self.tooltip(for: key.action)
 
         isBordered = false
         bezelStyle = .regularSquare
@@ -419,6 +472,15 @@ final class KeyButton: NSButton {
     }
 
     required init?(coder: NSCoder) { fatalError("not used") }
+
+    private static func tooltip(for action: KeyboardView.Action) -> String? {
+        switch action {
+        case .modifier(.control): return "Control"
+        case .modifier(.option): return "Option (Alt)"
+        case .modifier(.command): return "Command"
+        default: return nil
+        }
+    }
 
     /// Every click into this keyboard is a first-mouse click — the app is an accessory and
     /// the panel refuses key status. `NSButton` declines those by default, which would make
